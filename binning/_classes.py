@@ -26,13 +26,16 @@ from matplotlib import pyplot as plt
 
 class ScBase:
     def __init__(self, n_iter = 10, n_jobs = None, p = 3, min_rate = .5, 
-                 threshold = 0, best = True, random_state = None):
+                 threshold = .0, best = True, outlier = True, 
+                 missing_values = None, random_state = None):
         self.n_iter = n_iter
         self.n_jobs = n_jobs
         self.p = p
         self.min_rate = min_rate
         self.threshold = threshold
         self.best = best   
+        self.outlier = outlier
+        self.missing_values = missing_values
         self.random_state = random_state
 
 class ScBinning:
@@ -40,7 +43,8 @@ class ScBinning:
     
     """
     def __init__(self, n_iter = 10, n_jobs = None, p = 3, min_rate = .5, 
-                 threshold = 0, best = True, plot = False, random_state = None):
+                 threshold = .0, best = True, plot = False, outlier = True, 
+                 missing_values = None, random_state = None):
         self.n_iter = n_iter
         self.n_jobs = n_jobs
         self.p = p
@@ -48,6 +52,8 @@ class ScBinning:
         self.threshold = threshold
         self.best = best
         self.plot = plot
+        self.outlier = outlier
+        self.missing_values = missing_values
         self.random_state = random_state
      
     def _woe(self, X, y):
@@ -75,7 +81,7 @@ class ScBinning:
         thresholds = np.hstack(thresholds)
         thresholds.sort()
         thres, cnt_thres = np.unique(thresholds, return_counts = True)
-        
+ 
         i = 0        
         while i <= len(thres):       
             if i == 0:
@@ -159,10 +165,13 @@ class ScBinning:
             else:
                 X_tt = X_tt + np.where(X > thres_1[k-1], k, 0)
             k += 1
-        
+            
+        thres_1 = np.append(thres_1, np.inf)
+        thres_1.sort()
+    
         woe, iv, col_ = self._woe(X_tt, y)
         
-        thres_1 = np.vstack((col_, np.append(thres_1, np.inf), woe))
+        thres_1 = np.vstack((col_, thres_1, woe))
                          
         return thres_1, iv.sum()
                        
@@ -182,7 +191,67 @@ class ScBinning:
             else:
                 is_leaves[node_id] = True
         return threshold[~is_leaves]
+    
+    def _prefit(self, X, y, i):
+        X_t = X.copy()
+        y_t = y
+        if self.missing_values is not None:
+            if isinstance(self.missing_values, list):
+                m_v = self.missing_values
+            else:
+                m_v = [self.missing_values]
+            m_out = ~X_t.isin(m_v).values
+            X_t = X_t[m_out]
+            y_t = y_t[m_out]
+        if self.outlier:
+            Q1 = X_t.quantile(.25)
+            Q3 = X_t.quantile(.75)
+            IQR = Q3 - Q1
+            q_out = ~((X_t < (Q1 - 1.5 * IQR)) | (X_t > (Q3 + 1.5 * IQR)))
+            X_t = X_t[q_out]
+            y_t = y_t[q_out]
+        try:
+            X_t = VarianceThreshold(self.threshold).fit_transform(X_t.values.reshape(-1,1))
+        except ValueError:
+            sys.stdout.write(' No feature in X meets the variance threshold 0.00000\n')
+        else:
+            try:
+                self.thres_[i], self.iv_[i] = self._superbin(X_t, y_t)
+                self.columns_.append(i)
+            except (IndexError, ValueError):
+                sys.stdout.write(' No optimal splits\n')
+            else:
+                if self.missing_values is not None:
+                    l = 0
+                    while l < len(m_v):
+                        if m_v[l] not in X.values:
+                            m_v = np.delete(m_v, l)
+                        else:
+                            l += 1  
+                    X_t = np.zeros(len(X), dtype = float)
+                    X_tt = X.values
+                    for j in range(self.thres_[i].shape[1]):
+                        if j == 0:
+                            X_t = X_t + np.where(X_tt <= self.thres_[i][1][j], self.thres_[i][0][j], 0)
+                        else:
+                            X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
+                                    self.thres_[i][0][j], 0)
+                    
+                    for l in range(len(m_v)):
+                        X_t[X_tt == m_v[l]] = m_v[l]
+                    
+                    thres_1 = self.thres_[i][1]
+                    thres_1 = np.append(m_v, thres_1)
+                    thres_1.sort()
+                    
+                    woe, iv, col_ = self._woe(X_t, y)
 
+                    thres_1 = np.vstack((col_, thres_1, woe))
+             
+                    self.thres_[i], self.iv_[i] = thres_1, iv.sum()
+        return self
+    
+    
     def fit(self, X, y):
         if not isinstance(X, (pd.core.frame.DataFrame, 
                               pd.core.series.Series, np.ndarray)):
@@ -204,47 +273,60 @@ class ScBinning:
                     sys.stdout.write('Categorical values, try ScCatBinning instead!\n')
                     continue
                 else:
-                    try:
-                        X_t = X[i].values.reshape(-1,1)#VarianceThreshold(self.threshold).fit_transform(X[i].values.reshape(-1,1))
-                        self.thres_[i], self.iv_[i] = self._superbin(X_t, y)
-                        self.columns_.append(i)
-                    except:
-                        sys.stdout.write(' No feature in X meets the variance threshold 0.00000\n')
-                        continue
+                    self._prefit(X[i], y, i)
                 
         if isinstance(X, pd.core.series.Series):
             sys.stdout.write('Processing : %s, %s out of %s.\n' % (X.name, 1, 1))
             sys.stdout.flush()
             if X.dtype != 'object':
-                X_t = VarianceThreshold(self.threshold).fit_transform(X.values.reshape(-1,1))
-                self.thres_[X.name], self.iv_[X.name] = self._superbin(X_t, y)
+                self._prefit(X, y, X.name)
+                
+                                
         if isinstance(X, np.ndarray):
             try:
-                X.shape[1] == 1
-            except:
+                X.shape[1] > 1
+            except IndexError:
                 sys.stdout.write('Processing : %s, %s out of %s.\n' % (0, 1, 1))
                 sys.stdout.flush()
-                raise ValueError('Expected 2D array, got 1D array instead:\
-                                 Reshape your data either using array.reshape(-1, 1) if your data has a single feature or array.reshape(1, -1) if it contains a single sample.')
-            if X.shape[1] == 1:
-                sys.stdout.write('Processing : %s, %s out of %s.\n' % (0, 1, 1))
-                sys.stdout.flush()
-                X_t = VarianceThreshold(self.threshold).fit_transform(X)
-                self.thres_[0], self.iv_[0] = self._superbin(X_t, y)
+                self._prefit(pd.Series(X), y, 0)
+                
             else:
                 self.n_features_ = len(X.T)
                 for i in range(len(X.T)):
                     sys.stdout.write('Processing : %s, %s out of %s.\n' % (i, i+1, len(X.T)))
                     sys.stdout.flush()
-                    try:
-                        X_t = check_array(X[:,i].reshape(-1,1))
-                        self.thres_[i], self.iv_[i] = self._superbin(X[:,i].reshape(-1,1), y)
-                    except:
-                        continue
+                    self._prefit(pd.Series(X[:,i]), y, i)
+                    
         sys.stdout.write('Done! \n')
         return self
     
-    def predict_woe(self, X):
+    def _prepredict(self, X, i, k):            
+        if self.missing_values is not None:
+            if isinstance(self.missing_values, list):
+                m_v = self.missing_values
+            else:
+                m_v = [self.missing_values]
+            l = 0
+            while l < len(m_v):
+                if m_v[l] not in X.values:
+                    m_v = np.delete(m_v, l)
+                else:
+                    l += 1
+        X_t = np.zeros(len(X), dtype = float).reshape(-1, 1)
+        X_tt = X.values.reshape(-1,1)
+        for j in range(self.thres_[i].shape[1]):
+            if (j == 0) & (self.thres_[i][1][j] not in m_v):
+                X_t = X_t + np.where(X_tt <= self.thres_[i][1][j], self.thres_[i][k][j], 0)
+            elif self.thres_[i][1][j] not in m_v:
+                X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
+                                     self.thres_[i][k][j], 0)
+        for j in range(self.thres_[i].shape[1]):
+            if self.thres_[i][1][j] in m_v:
+                X_t[X_tt == self.thres_[i][1][j]] = self.thres_[i][k][j]
+        return X_t 
+        
+    
+    def predict(self, X, types = 'woe', return_all_col = False):
         if not isinstance(X, (pd.core.frame.DataFrame, 
                           pd.core.series.Series, np.ndarray)):
             raise ValueError('Invalid data object')
@@ -258,54 +340,21 @@ class ScBinning:
                                  % (self.n_features_, X.shape[1]))
             for i in X:
                 if i in self.columns_:
-                    X_t = np.zeros(len(X[i]), dtype = float).reshape(-1, 1)
-                    X_tt = X[i].values.reshape(-1,1)
-                    for j in range(self.thres_[i].shape[1]):
-                        if j == 0:
-                            X_t = X_t + np.where(X_tt <= self.thres_[i][1][j], self.thres_[i][2][j], 0)
-                        else:
-                            X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
-                                                 self.thres_[i][2][j], 0)
-                     
-                    X_s[i] = X_t
+                    X_s[i] = self._prepredict(X[i], i, 0 if types == 'category' else 2)
+                if ~return_all_col:
+                    X_s = X_s[self.columns_]
+                    
     
         if isinstance(X, pd.core.series.Series):
         
             if X.name in self.thres_.keys():
-                X_t = np.zeros(len(X), dtype = float)
-                X_tt = X.values
-                for j in range(self.thres_[X.name].shape[1]):
-                    if j == 0:
-                        X_t = X_t + np.where(X_tt <= self.thres_[X.name][1][j], self.thres_[X.name][2][j], 0)
-                    else:
-                        X_t = X_t + np.where((X_tt <= self.thres_[X.name][1][j]) & (X_tt > self.thres_[X.name][1][j-1]), 
-                                                self.thres_[X.name][2][j], 0)
-                        
-                X_s = pd.Series(X_t)
+                X_s = self._prepredict(X, X.name, 0 if types == 'category' else 2)
+                
         if isinstance(X, np.ndarray):
             try:
-                X.shape[1] == 1
+                X.shape[1] > 1
             except:
-                sys.stdout.write('Processing : %s, %s out of %s.\n' % (0, 1, 1))
-                sys.stdout.flush()
-                raise ValueError('Expected 2D array, got 1D array instead:\
-                                 Reshape your data either using array.reshape(-1, 1) if your data has a single feature or array.reshape(1, -1) if it contains a single sample.')
-            if X.shape[1] == 1:
-                sys.stdout.write('Processing : %s, %s out of %s.\n' % (0, 1, 1))
-                sys.stdout.flush()
-                try:
-                    X_tt = check_array(X)
-                    X_t = np.zeros(len(X), dtype = float).reshape(-1,1)
-                    for j in range(self.thres_[0].shape[1]):
-                        if j == 0:
-                            X_t = X_t + np.where(X_tt <= self.thres_[0][1][j], self.thres_[0][2][j], 0)
-                        else:
-                            X_t = X_t + np.where((X_tt <= self.thres_[0][1][j]) & (X_tt > self.thres_[0][1][j-1]), 
-                                                 self.thres_[0][2][j], 0)
-                    X_s = X_t
-                except:
-                    sys.stdout.write('Cannot process, return origin!\n')
-                
+                X_s = self._prepredict(pd.Series(X), 0, 0 if types == 'category' else 2)
             else:
                 if self.n_features_ != len(X.T):
                     raise ValueError("Number of features of the model must "
@@ -313,19 +362,10 @@ class ScBinning:
                                      "input n_features is %s "
                                      % (self.n_features_, len(X.T)))
                 for i in range(len(X.T)):
-                    try:
-                        X_tt = check_array(X[:,i].reshape(-1,1))
-                        X_t = np.zeros(len(X[:,i]), dtype = float).reshape(-1,1)
-                        for j in range(self.thres_[i].shape[1]):
-                            if j == 0:
-                                X_t = X_t + np.where(X_tt <= self.thres_[i][1][j], self.thres_[i][2][j], 0)
-                            else:
-                                X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
-                                                     self.thres_[i][2][j], 0)
-                        X_s[:,i] = X_t.flatten()
-                    
-                    except:
-                        sys.stdout.write('Cannot process, return origin!\n')
+                    if i in self.columns_:
+                        X_s[:,i] = self._prepredict(pd.Series(X[:,i]), i, 0 if types == 'category' else 2)
+                    if ~return_all_col:
+                        X_s = X_s[:,self.columns_]
         return X_s
         
 class ScCatBinning:
