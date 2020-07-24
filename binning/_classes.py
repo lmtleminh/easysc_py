@@ -341,8 +341,8 @@ class ScBinning:
             for i in X:
                 if i in self.columns_:
                     X_s[i] = self._prepredict(X[i], i, 0 if types == 'category' else 2)
-                if ~return_all_col:
-                    X_s = X_s[self.columns_]
+            if ~return_all_col:
+                X_s = X_s[self.columns_]
                     
     
         if isinstance(X, pd.core.series.Series):
@@ -354,7 +354,7 @@ class ScBinning:
             try:
                 X.shape[1] > 1
             except:
-                X_s = self._prepredict(pd.Series(X), 0, 0 if types == 'category' else 2)
+                X_s = self._prepredict(pd.Series(X), 0, 0 if types == 'category' else 2).reshape(1, -1)
             else:
                 if self.n_features_ != len(X.T):
                     raise ValueError("Number of features of the model must "
@@ -363,9 +363,9 @@ class ScBinning:
                                      % (self.n_features_, len(X.T)))
                 for i in range(len(X.T)):
                     if i in self.columns_:
-                        X_s[:,i] = self._prepredict(pd.Series(X[:,i]), i, 0 if types == 'category' else 2)
-                    if ~return_all_col:
-                        X_s = X_s[:,self.columns_]
+                        X_s[:,i] = self._prepredict(pd.Series(X[:,i]), i, 0 if types == 'category' else 2).reshape(1, -1)
+                if ~return_all_col:
+                    X_s = X_s[:,self.columns_]
         return X_s
         
 class ScCatBinning:
