@@ -23,9 +23,10 @@ from joblib import Parallel, delayed
 from joblib import parallel_backend
 import sys
 from matplotlib import pyplot as plt
+import optuna
 
 class ScBase:
-    def __init__(self, n_iter = 10, n_jobs = None, p = 3, min_rate = .5, 
+    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
                  threshold = .0, best = True, outlier = True, 
                  missing_values = None, random_state = None):
         self.n_iter = n_iter
@@ -42,7 +43,7 @@ class ScBinning:
     """
     
     """
-    def __init__(self, n_iter = 10, n_jobs = None, p = 3, min_rate = .5, 
+    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
                  threshold = .0, best = True, plot = False, outlier = True, 
                  missing_values = None, random_state = None):
         self.n_iter = n_iter
@@ -57,13 +58,50 @@ class ScBinning:
         self.random_state = random_state
      
     def _woe(self, X, y):
-        pct_b = [y[X == j].sum() for j in np.unique(X)] / y.sum()
-        pct_g = [(1-y[X == j]).sum() for j in np.unique(X)] / (1-y).sum()
+        b = pd.Series(y.reshape(1, -1)[0], name = 'BAD')
+        g = pd.Series((1-y).reshape(1, -1)[0], name = 'GOOD')
+        X_x = pd.concat((X, b, g), axis = 1).groupby(X.name).agg('sum')
+        pct_b = (X_x / b.sum()).values[:,0]
+        pct_g = (X_x / g.sum()).values[:,1]
         woe = np.log(pct_g / pct_b)
         iv = (pct_g - pct_b) * woe
-        return (woe, iv, np.unique(X))
+        return (woe, iv, np.array(X_x.index))
     
     def _superbin(self, X, y):
+        def _optimal_bin(n_cl):
+            k_md = KMeans(n_clusters = n_cl, random_state = self.random_state)
+            k_md.fit(thres.reshape(-1, 1))
+            thres_g = k_md.predict(thres.reshape(-1, 1))
+            
+            new_thres = np.zeros(np.unique(thres_g).max() + 1, dtype = 'float64')
+            for i in np.unique(thres_g):
+                new_thres[i] = (thres[thres_g == i] * cnt_thres[thres_g == i]).sum() / cnt_thres[thres_g == i].sum()
+            new_thres.sort()
+            new_thres = np.append(new_thres, np.inf)
+            
+            i = 0
+            n = X.shape[0]
+            pre_b_r = .0
+            while i < len(new_thres):
+                if len(thres) <= 1:
+                    break  
+                lower_b = (X > new_thres[i-1]) if i > 0 else (np.ones(n) == 1).reshape(-1, 1)
+                upper_b = (X <= new_thres[i])
+                if (lower_b & upper_b).sum()/n < self.p:
+                    new_thres = np.delete(new_thres, i if i < (len(new_thres) - 1) else i - 1)
+                    i = 0
+                elif np.abs(y[(lower_b & upper_b)].mean() - pre_b_r) < self.min_rate:
+                    new_thres = np.delete(new_thres, i if i < (len(new_thres) - 1) else i - 1)
+                    i = 0
+                else:
+                    pre_b_r = y[(lower_b & upper_b)].mean()
+                    i += 1
+            
+            new_thres = np.append(new_thres, -np.inf)
+            new_thres.sort()
+            X_x = pd.cut(pd.Series(X.reshape(1, -1)[0], name = 'X'), new_thres, labels = new_thres[1:]).astype('float64')
+            return self._woe(X_x, y)
+        
         #set seed
         np.random.seed(self.random_state)
         #bootstrap sampling
@@ -81,99 +119,85 @@ class ScBinning:
         thresholds = np.hstack(thresholds)
         thresholds.sort()
         thres, cnt_thres = np.unique(thresholds, return_counts = True)
- 
-        i = 0        
-        while i <= len(thres):       
-            if i == 0:
-                bad_rate = np.zeros(len(thres) + 1, dtype = 'float64')
-                cnt = np.zeros(len(thres) + 1, dtype = 'int64')
-                bad_rate[i] = y[X <= thres[i]].mean()
-                cnt[i] = len(y[X <= thres[i]])
-            elif i < len(thres):
-                bad_rate[i] = y[(X <= thres[i]) & (X > thres[i-1])].mean()
-                cnt[i] = len(y[(X <= thres[i]) & (X > thres[i-1])])
-            else:
-                bad_rate[i] = y[X > thres[i-1]].mean()
-                cnt[i] = len(y[X > thres[i-1]])
-            #i += 1
-            
-            #handle 0 length array
-            #bad_rate[np.isnan(bad_rate)] = 0
-            if cnt[i] / len(X) <= 0:#self.p / 100:
-                dlt = i-1 if (i == len(thres)) | (cnt_thres[i] > cnt_thres[i-1]) else i
-                thres = np.delete(thres, dlt)
-                cnt_thres = np.delete(cnt_thres, dlt)
-                i = 0
-            else:
-                i += 1
         
-        #trend
-        ins = np.polyfit(thres, bad_rate[:-1], 1)[0]
+        def objective(trial):
+            n_cl = trial.suggest_int('n_clusters', 2, 10)
+            iv = _optimal_bin(n_cl)[1].sum()
+            return -iv
+        
+        optuna.logging.disable_default_handler()
+        study = optuna.create_study()
+        study.optimize(objective, n_trials = 20)
+
+        woe, iv, thres_1 = _optimal_bin(study.best_params['n_clusters'])       
+         
+        # #trend
+        # ins = np.polyfit(thres, bad_rate[:-1], 1)[0]
        
-        #prepare iso table
-        iso_t = np.hstack((np.append(thres, thres.max() + 1).reshape(-1,1), 
-                           bad_rate.reshape(-1,1)))
-        iso_t = np.repeat(iso_t, np.append(cnt_thres, 1), axis = 0)
+        # #prepare iso table
+        # iso_t = np.hstack((np.append(thres, thres.max() + 1).reshape(-1,1), 
+        #                    bad_rate.reshape(-1,1)))
+        # iso_t = np.repeat(iso_t, np.append(cnt_thres, 1), axis = 0)
         
-        #iso regression
-        ir = IsotonicRegression(increasing = (ins >= 0))
-        bad_rate_fit = ir.fit_transform(iso_t[:,0], iso_t[:,1])
-        thresholds_t = np.hstack((iso_t[:,0].reshape(-1,1), bad_rate_fit.reshape(-1,1)))
+        # #iso regression
+        # ir = IsotonicRegression(increasing = (ins >= 0))
+        # bad_rate_fit = ir.fit_transform(iso_t[:,0], iso_t[:,1])
+        # thresholds_t = np.hstack((iso_t[:,0].reshape(-1,1), bad_rate_fit.reshape(-1,1)))
         
-        if self.plot:
-            fig = plt.figure()
-            plt.plot(iso_t[:,0], iso_t[:,1], 'r.')
-            plt.plot(iso_t[:,0], bad_rate_fit, 'b-')
-            plt.show()
+        # if self.plot:
+        #     fig = plt.figure()
+        #     plt.plot(iso_t[:,0], iso_t[:,1], 'r.')
+        #     plt.plot(iso_t[:,0], bad_rate_fit, 'b-')
+        #     plt.show()
         
-        thres_1 = np.array([thresholds_t[thresholds_t[:,1] == x, 0].mean() for x in np.unique(thresholds_t[:,1])])
-        thres_1.sort()
+        # thres_1 = np.array([thresholds_t[thresholds_t[:,1] == x, 0].mean() for x in np.unique(thresholds_t[:,1])])
+        # thres_1.sort()
         
-        j = 0
-        while j <= len(thres_1):
-            if len(thres_1) <= 1:
-                print('Minimum number of bins encountered!\n')
-                break
-            if j == 0:
-                bad_rate_1 = np.zeros(len(thres_1) + 1, dtype = 'float64')
-                cnt_1 = np.zeros(len(thres_1) + 1, dtype = 'int64')
-                bad_rate_1[j] = y[X <= thres_1[j]].mean()
-                cnt_1[j] = len(y[X <= thres_1[j]])
-            elif j < len(thres_1):
-                bad_rate_1[j] = y[(X <= thres_1[j]) & (X > thres_1[j-1])].mean()
-                cnt_1[j] = len(y[(X <= thres_1[j]) & (X > thres_1[j-1])])
-            else:
-                bad_rate_1[j] = y[X > thres_1[j-1]].mean()
-                cnt_1[j] = len(y[X > thres_1[j-1]])
+        # j = 0
+        # while j <= len(thres_1):
+        #     if len(thres_1) <= 1:
+        #         print('Minimum number of bins encountered!\n')
+        #         break
+        #     if j == 0:
+        #         bad_rate_1 = np.zeros(len(thres_1) + 1, dtype = 'float64')
+        #         cnt_1 = np.zeros(len(thres_1) + 1, dtype = 'int64')
+        #         bad_rate_1[j] = y[X <= thres_1[j]].mean()
+        #         cnt_1[j] = len(y[X <= thres_1[j]])
+        #     elif j < len(thres_1):
+        #         bad_rate_1[j] = y[(X <= thres_1[j]) & (X > thres_1[j-1])].mean()
+        #         cnt_1[j] = len(y[(X <= thres_1[j]) & (X > thres_1[j-1])])
+        #     else:
+        #         bad_rate_1[j] = y[X > thres_1[j-1]].mean()
+        #         cnt_1[j] = len(y[X > thres_1[j-1]])
             
-            if j >= 0:
-                if (abs(bad_rate_1[j] - bad_rate_1[j-1]) < self.min_rate/100) | (cnt_1[j] / len(X) < self.p / 100): #self
-                    thres_1 = np.delete(thres_1, j-1 if j == len(thres_1) else j)
-                    j = 0
-                else:
-                    j += 1
-            else:
-                j += 1     
+        #     if j >= 0:
+        #         if (abs(bad_rate_1[j] - bad_rate_1[j-1]) < self.min_rate/100) | (cnt_1[j] / len(X) < self.p / 100): #self
+        #             thres_1 = np.delete(thres_1, j-1 if j == len(thres_1) else j)
+        #             j = 0
+        #         else:
+        #             j += 1
+        #     else:
+        #         j += 1     
         
-        k = 0
-        X_tt = np.zeros(len(X), dtype = 'int').reshape(-1,1)
-        while k <= len(thres_1):
-            if k == 0:
-                X_tt = X_tt + np.where(X <= thres_1[k], k, 0)
-            elif k < len(thres_1):
-                X_tt = X_tt + np.where((X <= thres_1[k]) & (X > thres_1[k-1]), k, 0)
-            else:
-                X_tt = X_tt + np.where(X > thres_1[k-1], k, 0)
-            k += 1
+        # k = 0
+        # X_tt = np.zeros(len(X), dtype = 'int').reshape(-1,1)
+        # while k <= len(thres_1):
+        #     if k == 0:
+        #         X_tt = X_tt + np.where(X <= thres_1[k], k, 0)
+        #     elif k < len(thres_1):
+        #         X_tt = X_tt + np.where((X <= thres_1[k]) & (X > thres_1[k-1]), k, 0)
+        #     else:
+        #         X_tt = X_tt + np.where(X > thres_1[k-1], k, 0)
+        #     k += 1
             
-        thres_1 = np.append(thres_1, np.inf)
-        thres_1.sort()
+        # thres_1 = np.append(thres_1, np.inf)
+        # thres_1.sort()
     
-        woe, iv, col_ = self._woe(X_tt, y)
+        # woe, iv, col_ = self._woe(X_tt, y)
         
-        thres_1 = np.vstack((col_, thres_1, woe))
-                         
-        return thres_1, iv.sum()
+        col_ = np.arange(len(thres_1))
+                                 
+        return np.vstack((col_, thres_1, woe)), iv.sum()
                        
     def _treeBin(self, X, y):  
         clf = DecisionTreeClassifier(max_depth = 2, random_state = self.random_state)
@@ -213,7 +237,7 @@ class ScBinning:
         try:
             X_t = VarianceThreshold(self.threshold).fit_transform(X_t.values.reshape(-1,1))
         except ValueError:
-            sys.stdout.write(' No feature in X meets the variance threshold 0.00000\n')
+            sys.stdout.write(' No feature in X meets the variance threshold {}\n'.format(self.threshold))
         else:
             try:
                 self.thres_[i], self.iv_[i] = self._superbin(X_t, y_t)
@@ -237,15 +261,13 @@ class ScBinning:
                             X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
                                     self.thres_[i][0][j], 0)
                     
-                    for l in range(len(m_v)):
-                        X_t[X_tt == m_v[l]] = m_v[l]
-                    
                     thres_1 = self.thres_[i][1]
-                    thres_1 = np.append(m_v, thres_1)
-                    thres_1.sort()
+                    for l in range(len(m_v)):
+                        X_t[X_tt == m_v[l]] = -(l + 1) #m_v[l]
+                        thres_1 = np.append(m_v[l], thres_1)
                     
-                    woe, iv, col_ = self._woe(X_t, y)
-
+                    woe, iv, col_ = self._woe(pd.Series(X_t.reshape(1, -1)[0], name = 'X'), y)
+                
                     thres_1 = np.vstack((col_, thres_1, woe))
              
                     self.thres_[i], self.iv_[i] = thres_1, iv.sum()
@@ -312,13 +334,16 @@ class ScBinning:
                     m_v = np.delete(m_v, l)
                 else:
                     l += 1
+        else:
+            m_v = []
         X_t = np.zeros(len(X), dtype = float).reshape(-1, 1)
         X_tt = X.values.reshape(-1,1)
         for j in range(self.thres_[i].shape[1]):
             if (j == 0) & (self.thres_[i][1][j] not in m_v):
                 X_t = X_t + np.where(X_tt <= self.thres_[i][1][j], self.thres_[i][k][j], 0)
             elif self.thres_[i][1][j] not in m_v:
-                X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & (X_tt > self.thres_[i][1][j-1]), 
+                X_t = X_t + np.where((X_tt <= self.thres_[i][1][j]) & \
+                                     (X_tt > (self.thres_[i][1][j-1] if self.thres_[i][1][j-1] not in m_v else -np.inf)), 
                                      self.thres_[i][k][j], 0)
         for j in range(self.thres_[i].shape[1]):
             if self.thres_[i][1][j] in m_v:
@@ -372,7 +397,7 @@ class ScCatBinning:
     """
     
     """
-    def __init__(self, n_iter = 10, n_jobs = None, p = 3, min_rate = .5, 
+    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
                  threshold = 0, best = True, random_state = None):
         self.n_iter = n_iter
         self.n_jobs = n_jobs
@@ -429,7 +454,7 @@ class ScCatBinning:
           for i in range(thres.shape[1]):
             X_t = X_t + (np.where(X == thres[1,i], thres[0][i], 0))
         
-          if np.any(np.unique(X_t, return_counts= True)[1] / len(X_t) < self.p / 100): 
+          if np.any(np.unique(X_t, return_counts= True)[1] / len(X_t) < self.p): 
             n -= 1
           else:
             b = False
