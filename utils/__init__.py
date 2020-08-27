@@ -6,5 +6,6 @@ Created on Tue Dec 17 15:04:16 2019
 """
 
 from ._scorecard import ScScore
+from ._scFeatureSelection import scFeatureSelection
 
-__all__ = ["ScScore"]
+__all__ = ["ScScore", "scFeatureSelection"]

@@ -12,6 +12,7 @@ which is only applied on factor variables.
 
 """
 
+from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.isotonic import IsotonicRegression
 from sklearn.feature_selection import VarianceThreshold
@@ -68,7 +69,7 @@ class ScBinning:
         return (woe, iv, np.array(X_x.index))
     
     def _superbin(self, X, y):
-        def _optimal_bin(n_cl):
+        def _optimal_bin(n_cl, p, min_rate):
             k_md = KMeans(n_clusters = n_cl, random_state = self.random_state)
             k_md.fit(thres.reshape(-1, 1))
             thres_g = k_md.predict(thres.reshape(-1, 1))
@@ -80,57 +81,73 @@ class ScBinning:
             new_thres = np.append(new_thres, np.inf)
             
             i = 0
-            n = X.shape[0]
+            n = train_X.shape[0]
             pre_b_r = .0
             while i < len(new_thres):
-                if len(thres) <= 1:
+                if len(new_thres) <= 2:
                     break  
-                lower_b = (X > new_thres[i-1]) if i > 0 else (np.ones(n) == 1).reshape(-1, 1)
-                upper_b = (X <= new_thres[i])
-                if (lower_b & upper_b).sum()/n < self.p:
+                lower_b = (train_X > new_thres[i-1]) if i > 0 else (np.ones(n) == 1).reshape(-1, 1)
+                upper_b = (train_X <= new_thres[i])
+                if (lower_b & upper_b).sum()/n < p:
                     new_thres = np.delete(new_thres, i if i < (len(new_thres) - 1) else i - 1)
                     i = 0
-                elif np.abs(y[(lower_b & upper_b)].mean() - pre_b_r) < self.min_rate:
+                elif np.abs(train_y[(lower_b & upper_b)].mean() - pre_b_r) < min_rate:
                     new_thres = np.delete(new_thres, i if i < (len(new_thres) - 1) else i - 1)
                     i = 0
                 else:
-                    pre_b_r = y[(lower_b & upper_b)].mean()
+                    pre_b_r = train_y[(lower_b & upper_b)].mean()
                     i += 1
             
             new_thres = np.append(new_thres, -np.inf)
             new_thres.sort()
-            X_x = pd.cut(pd.Series(X.reshape(1, -1)[0], name = 'X'), new_thres, labels = new_thres[1:]).astype('float64')
-            return self._woe(X_x, y)
+            
+            X_x = pd.cut(pd.Series(val_X.reshape(1, -1)[0], name = 'X'), new_thres, labels = new_thres[1:]).astype('float64')
+            return self._woe(X_x, val_y)
         
+        train_X, val_X, train_y, val_y = train_test_split(X, y, train_size = .8,
+                                                          random_state = self.random_state,
+                                                          stratify = y)
+               
         #set seed
         np.random.seed(self.random_state)
         #bootstrap sampling
-        idx = np.arange(0, X.shape[0])
+        idx = np.arange(0, train_X.shape[0])
         
-        idx_bt = np.concatenate((np.random.choice(idx, 
-                                               (len(idx), self.n_iter
-                                                ), replace = True), idx.reshape(-1,1)), axis = 1)
+        idx_bt = np.concatenate((np.random.choice(idx, (len(idx), self.n_iter), 
+                                                  replace = True), idx.reshape(-1,1)), axis = 1)
         
         #run tree in parallel
         with parallel_backend('threading', n_jobs = self.n_jobs):
-            thresholds = Parallel()(delayed(self._treeBin)(X[ix], y[ix]) for ix in idx_bt.T)
+            thresholds = Parallel()(delayed(self._treeBin)(train_X[ix], train_y[ix]) for ix in idx_bt.T)
         
         #calculate bad rate
         thresholds = np.hstack(thresholds)
         thresholds.sort()
         thres, cnt_thres = np.unique(thresholds, return_counts = True)
         
+        #kmeans
         def objective(trial):
-            n_cl = trial.suggest_int('n_clusters', 2, 10)
-            iv = _optimal_bin(n_cl)[1].sum()
-            return -iv
+            n_cl = trial.suggest_int('n_clusters', 2,  min(10, thres.reshape(-1, 1).shape[0]))
+            if isinstance(self.p, list):
+                p = trial.suggest_uniform('p', min(self.p), max(self.p))
+            elif isinstance(self.p, float):
+                p = self.p
+            if isinstance(self.min_rate, list):
+                min_rate = trial.suggest_uniform('min_rate', min(self.min_rate), max(self.min_rate))
+            elif isinstance(self.min_rate, float):
+                min_rate = self.min_rate
+            iv = _optimal_bin(n_cl, p, min_rate)[1].sum()
+            return iv
         
         optuna.logging.disable_default_handler()
-        study = optuna.create_study()
+        study = optuna.create_study(direction = 'maximize')
         study.optimize(objective, n_trials = 20)
 
-        woe, iv, thres_1 = _optimal_bin(study.best_params['n_clusters'])       
-         
+        woe, iv, thres_1 = _optimal_bin(study.best_params['n_clusters'],
+                                        study.best_params['p'] if isinstance(self.p, list) else self.p,
+                                        study.best_params['min_rate'] if isinstance(self.min_rate, list) else self.min_rate)
+        
+        #isotonic
         # #trend
         # ins = np.polyfit(thres, bad_rate[:-1], 1)[0]
        
@@ -196,7 +213,6 @@ class ScBinning:
         # woe, iv, col_ = self._woe(X_tt, y)
         
         col_ = np.arange(len(thres_1))
-                                 
         return np.vstack((col_, thres_1, woe)), iv.sum()
                        
     def _treeBin(self, X, y):  
