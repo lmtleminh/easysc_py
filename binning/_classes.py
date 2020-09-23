@@ -11,7 +11,7 @@ group the optimal categories by utilizing the
 which is only applied on factor variables.
 
 """
-
+import abc
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.isotonic import IsotonicRegression
@@ -39,25 +39,7 @@ class ScBase:
         self.outlier = outlier
         self.missing_values = missing_values
         self.random_state = random_state
-
-class ScBinning:
-    """
     
-    """
-    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
-                 threshold = .0, best = True, plot = False, outlier = True, 
-                 missing_values = None, random_state = None):
-        self.n_iter = n_iter
-        self.n_jobs = n_jobs
-        self.p = p
-        self.min_rate = min_rate
-        self.threshold = threshold
-        self.best = best
-        self.plot = plot
-        self.outlier = outlier
-        self.missing_values = missing_values
-        self.random_state = random_state
-     
     def _woe(self, X, y):
         b = pd.Series(y.reshape(1, -1)[0], name = 'BAD')
         g = pd.Series((1-y).reshape(1, -1)[0], name = 'GOOD')
@@ -67,6 +49,26 @@ class ScBinning:
         woe = np.log(pct_g / pct_b)
         iv = (pct_g - pct_b) * woe
         return (woe, iv, np.array(X_x.index))
+    
+    @abc.abstractmethod
+    def fit(self):
+        return self
+    
+    @abc.abstractmethod
+    def predict(self):
+        return self
+
+class ScBinning(ScBase):
+    """
+    
+    """
+    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
+                 threshold = .0, best = True, plot = False, outlier = True, 
+                 missing_values = None, random_state = None):
+        super().__init__(n_iter, n_jobs, p, min_rate, threshold, best, 
+                         outlier, missing_values, random_state)
+        self.plot = plot
+     
     
     def _superbin(self, X, y):
         def _optimal_bin(n_cl, p, min_rate):
@@ -409,26 +411,10 @@ class ScBinning:
                     X_s = X_s[:,self.columns_]
         return X_s
         
-class ScCatBinning:
+class ScCatBinning(ScBase):
     """
     
     """
-    def __init__(self, n_iter = 10, n_jobs = None, p = .03, min_rate = .05, 
-                 threshold = 0, best = True, random_state = None):
-        self.n_iter = n_iter
-        self.n_jobs = n_jobs
-        self.p = p
-        self.min_rate = min_rate
-        self.threshold = threshold
-        self.best = best   
-        self.random_state = random_state
-
-    def _woe(self, X, y):
-        pct_b = [y[X == j].sum() for j in np.unique(X)] / y.sum()
-        pct_g = [(1-y[X == j]).sum() for j in np.unique(X)] / (1-y).sum()
-        woe = np.log(pct_g / pct_b)
-        iv = (pct_g - pct_b) * woe
-        return (woe, iv, np.unique(X)) 
 
     def _impactCode(self, X, y):
         
@@ -475,7 +461,7 @@ class ScCatBinning:
           else:
             b = False
         
-        woe, iv, labels = self._woe(X_t, y)
+        woe, iv, labels = self._woe(pd.Series(X_t.reshape(1, -1)[0], name = 'X'), y)
         woe_label = np.vstack((woe, labels))
         woe_transform = np.zeros(thres.shape[1], dtype = float)
         for j in range(woe_label.shape[1]):
@@ -483,7 +469,7 @@ class ScCatBinning:
                                                       woe_label[0, j], 0))
         thres = np.vstack((thres, woe_transform))
         return thres, iv.sum()
-
+        
     def fit(self, X, y):
         if not isinstance(X, (pd.core.frame.DataFrame, 
                               pd.core.series.Series, np.ndarray)):
@@ -548,7 +534,18 @@ class ScCatBinning:
         sys.stdout.write('Done! \n')
         return self             
     
-    def predict_woe(self, X, impute_missing = True):
+    def _prepredict(self, X, i, k, impute_missing):
+        X_t = np.zeros(len(X), dtype = float).reshape(-1, 1)
+        X_tt = X.values.reshape(-1,1)
+        for j in range(self.thres_[i].shape[1]):
+            X_t = X_t + (np.where(X_tt == self.thres_[i][1,j],
+                                  self.thres_[i][k][j], 0))
+            if impute_missing:
+                X_t[X_t == 0] = self.thres_[i][k][j]
+        
+        return X_t
+    
+    def predict(self, X, types = 'woe', return_all_col = False, impute_missing = True):
         if not isinstance(X, (pd.core.frame.DataFrame, 
                               pd.core.series.Series, np.ndarray)):
             raise ValueError('Invalid data object')
@@ -562,28 +559,17 @@ class ScCatBinning:
                                  % (self.n_features_, X.shape[1]))
             for i in X:
                 if i in self.columns_:
-                    X_t = np.zeros(len(X[i]), dtype = float).reshape(-1, 1)
-                    X_tt = X[i].values.reshape(-1,1)
-                    for j in range(self.thres_[i].shape[1]):
-                        X_t = X_t + (np.where(X_tt == self.thres_[i][1,j], 
-                                          self.thres_[i][2][j], 0))
-                    if impute_missing:
-                        X_t[X_t == 0] = self.thres_[i][2][j]
-                        
-                    X_s[i] = X_t
+                    X_s[i] = self._prepredict(X[i], i, 0 if types == 'category' else 2,
+                                              impute_missing)
+            if ~return_all_col:
+                    X_s = X_s[self.columns_]
         
         if isinstance(X, pd.core.series.Series):
             
             if X.name in self.thres_.keys():
-                X_t = np.zeros(len(X), dtype = float)
-                X_tt = X.values
-                for j in range(self.thres_[X.name].shape[1]):
-                    X_t = X_t + (np.where(X_tt == self.thres_[X.name][1,j],
-                                          self.thres_[X.name][2][j], 0))
-                if impute_missing:
-                    X_t[X_t == 0] = self.thres_[X.name][2][j]
+                X_s = pd.Series(self._prepredict(X, X.name, 0 if types == 'category' else 2,
+                                                 impute_missing))
                 
-                X_s = pd.Series(X_t)
         if isinstance(X, np.ndarray):
             try:
                 X.shape[1] == 1
@@ -599,13 +585,8 @@ class ScCatBinning:
                     X = check_array(X)
                     sys.stdout.write('Numeric values, try ScBinning instead!\n')
                 except:
-                    X_t = np.zeros(len(X), dtype = float).reshape(-1,1)
-                    for j in range(self.thres_[0].shape[1]):
-                        X_t = X_t + (np.where(X == self.thres_[0][1,j],
-                                              self.thres_[0][2][j], 0))
-                    if impute_missing:
-                        X_t[X_t == 0] = self.thres_[0][2][j]
-                    X_s = X_t
+                    X_s = self._prepredict(X, 0, 0 if types == 'category' else 2,
+                                           impute_missing)
             else:
                 if self.n_features_ != len(X.T):
                     raise ValueError("Number of features of the model must "
@@ -617,13 +598,10 @@ class ScCatBinning:
                         X_t = check_array(X[:,i].reshape(-1,1))
                         sys.stdout.write('Numeric values, try ScBinning instead!\n')
                     except:
-                        X_t = np.zeros(len(X[:,i]), dtype = float)
-                        for j in range(self.thres_[i].shape[1]):
-                            X_t = X_t + (np.where(X[:,i] == self.thres_[i][1,j],
-                                              self.thres_[i][2][j], 0))
-                        if impute_missing:
-                            X_t[X_t == 0] = self.thres_[i][2][j]
-                        X_s[:,i] = X_t.flatten()
+                        X_s[:,i] = self._prepredict(X[:,i], i, 0 if types == 'category' else 2, 
+                                                    impute_missing).flatten()
+                if ~return_all_col:
+                    X_s = X_s[:,self.columns_]
         return X_s
     
     def update(self, X, y, var_name, group):
